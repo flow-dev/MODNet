@@ -16,7 +16,11 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import copy
 import logging
+import random
 from dataset import augmentation as A
+import glob
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
 
 
 logging.basicConfig(filename='Default.log', level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
@@ -28,7 +32,6 @@ logging.info('--------------------------------')
 torch_transforms = transforms.Compose(
     [
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ]
 )
 
@@ -286,7 +289,7 @@ class MobileNetV2Backbone(BaseBackbone):
 
     def load_pretrained_ckpt(self):
         # the pre-trained model is provided by https://github.com/thuyngch/Human-Segmentation-PyTorch
-        ckpt_path = './mobilenetv2_human_seg.ckpt'
+        ckpt_path = './pretrained/mobilenetv2_human_seg.ckpt'
         if not os.path.exists(ckpt_path):
             print('cannot find the pretrained mobilenetv2 backbone')
             exit()
@@ -544,44 +547,113 @@ class GaussianBlurLayer(nn.Module):
 class ImagesDataset(Dataset):
     """because of i want to use the modle author provided, i use the same size as the val in demo,
     if you want to change the size, change the size in code func: __getitem__, attention the shape"""
-    def __init__(self, root, transform=None, w=1024, h=576):
+    def __init__(self, root, bgdir=None, transform=None, w=1024, h=576):
+
         self.root = root
         self.transform = transform
         self.tensor = transforms.Compose([transforms.ToTensor()])
         self.w = w
         self.h = h
-        self.imgs = sorted([os.path.join(self.root, 'fgr', img) for img in os.listdir(os.path.join(self.root, 'fgr'))])
-        self.alphas = sorted([os.path.join(self.root, 'pha', aph) for aph in os.listdir(os.path.join(self.root, 'pha'))])
-        print(len(self.imgs))
+
+        #print(*glob.glob(os.path.join(root, 'fgr', '**', '*.jpg'), recursive=True))
+        
+        self.imgs = sorted([*glob.glob(os.path.join(root, 'fgr', '**', '*.jpg'), recursive=True),
+                            *glob.glob(os.path.join(root, 'fgr', '**', '*.png'), recursive=True)])
+        self.alphas = sorted([*glob.glob(os.path.join(root, 'pha', '**', '*.jpg'), recursive=True),
+                              *glob.glob(os.path.join(root, 'pha', '**', '*.png'), recursive=True)])
+
+        #print(*glob.glob(os.path.join(bgdir, '**', '*.jpg'), recursive=True))
+        self.bgs = sorted([*glob.glob(os.path.join(bgdir, '**', '*.jpg'), recursive=True),
+                            *glob.glob(os.path.join(bgdir, '**', '*.png'), recursive=True)])
+             
+        print("ImagesDataset:",len(self.imgs),len(self.alphas),len(self.bgs))
         assert len(self.imgs) == len(self.alphas), 'the number of dataset is different, please check it.'
 
     def getTrimap(self, alpha):
         fg = np.array(np.equal(alpha, 255).astype(np.float32))
         unknown = np.array(np.not_equal(alpha, 0).astype(np.float32))  # unknown = alpha > 0
         unknown = unknown - fg
-        unknown = morphology.distance_transform_edt(unknown == 0) <= np.random.randint(10, 20)
+        unknown = morphology.distance_transform_edt(unknown == 0) <= np.random.randint(5, 10)
         trimap = fg
         trimap[unknown] = 0.5
+
+        # import matplotlib.pyplot as plt
+        # plt.imshow(trimap)
+        # plt.show()
+
         return trimap[:, :, :1]
 
     def __len__(self):
         return len(self.imgs)
 
+    def horizontal_flip(self, image, rate=0.5):
+        if np.random.rand() < rate:
+            image = image[:, ::-1, :]
+        return image
+
+    def random_crop(self, image, crop_size=(576, 1024)):
+
+        h, w, _ = image.shape
+        
+        # 画像のtop, leftを決める
+        if(crop_size[0] <= crop_size[1]):
+            top = np.random.randint(0, h - crop_size[0])
+            left = np.random.randint(0, w - crop_size[1])
+        else:
+            top = np.random.randint(0, h - crop_size[1])
+            left = np.random.randint(0, w - crop_size[0])      
+
+        # bottomとrightを決める
+        bottom = top + crop_size[0]
+        right = left + crop_size[1]
+
+        # 決めたtop, bottom, left, rightを使って画像を抜き出す
+        image = image[top:bottom, left:right, :]
+        return image
+
     def __getitem__(self, idx):
         img = cv2.imread(self.imgs[idx])
         alpha = cv2.imread(self.alphas[idx])
-        # h, w, c = img.shape
-        # rh = 512
-        # rw = int(w / h * 512)
-        # rh = rh - rh % 32 #512
-        # rw = rw - rw % 32 #896    1024 or 576 %32==0
+
+        bgs_rand_idx = random.randint(0, len(self.bgs))
+        #print(bgs_rand_idx, len(self.bgs))
+        bgs = cv2.imread(self.bgs[bgs_rand_idx-1])
+    
+        #h, w, _ = img.shape
+        #if w >= h:
+        #    rh = 512
+        #    rw = int(w / h * 512)
+        #else:
+        #    rw = 512
+        #    rh = int(h / w * 512)
+        #rh = rh - rh % 32
+        #rw = rw - rw % 32
+
+        #bgs = self.random_crop(bgs, crop_size=(rh, rw))
+
         img = cv2.resize(img, (self.w, self.h))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
         alpha = cv2.resize(alpha, (self.w, self.h))
+
+        bgs = cv2.resize(bgs, (self.w, self.h))
+        bgs = cv2.cvtColor(bgs, cv2.COLOR_BGR2RGB)
+
+#        print(img.shape,alpha.shape,bgs.shape)
+
+        mix_img = (img * (alpha/255) + bgs * (1-(alpha/255))).astype(np.uint8)
+        #print(mix_img.shape)
+
+        # import matplotlib.pyplot as plt
+        # plt.imshow(mix_img)
+        # plt.show()
+
         trimap = self.getTrimap(alpha)
+
         if self.transform:
-            img = self.transform(img)
+            mix_img = self.transform(mix_img)
         alpha = self.tensor(alpha[:, :, 0])
-        return self.imgs[idx], img, trimap, alpha
+        return self.imgs[idx], mix_img, trimap, alpha
 
 
 # ----------------------------------------------------------------------------------
@@ -591,10 +663,11 @@ class ImagesSocDataset(Dataset):
         self.w = w
         self.h = h
         self.transform = transform
-        #self.imgs = [os.path.join(self.root, img) for img in os.listdir(self.root)]
-        self.imgs = sorted([os.path.join(self.root, 'fgr', img) for img in os.listdir(os.path.join(self.root, 'fgr'))])
-        # self.imgs = self.addFlip()
 
+        self.imgs = sorted([*glob.glob(os.path.join(root, 'fgr', '**', '*.jpg'), recursive=True),
+                            *glob.glob(os.path.join(root, 'fgr', '**', '*.png'), recursive=True)])
+
+        # self.imgs = self.addFlip()
 
     def addFlip(self):
         """flip image"""
@@ -684,6 +757,10 @@ def supervised_training_iter(
     # calculate the boundary mask from the trimap
     boundaries = (trimap < 0.5) + (trimap > 0.5)
 
+#    print(pred_matte.shape)
+#    print(boundaries.shape)
+#    print(trimap.shape)
+
     # calculate the semantic loss
     gt_semantic = F.interpolate(gt_matte, scale_factor=1 / 16, mode='bilinear')
     gt_semantic = blurer(gt_semantic)
@@ -710,7 +787,7 @@ def supervised_training_iter(
     optimizer.step()
 
     # for test
-    return semantic_loss, detail_loss, matte_loss
+    return semantic_loss, detail_loss, matte_loss, pred_matte
 
 
 def soc_adaptation_iter(
@@ -839,19 +916,27 @@ def soc_adaptation_iter(
 # ----------------------------------------------------------------------------------
 
 
-def main(root, resume=False, std=0):
+def main(root, root_valid, bg_path, resume=False, std=0, train_name="test"):
     """ resume=True if not first runing else False  """
+
     save_model_dir = 'SaveModel'
+    save_log_dir = 'log'
+    os.makedirs(save_model_dir, exist_ok=True)
+    os.makedirs(save_log_dir, exist_ok=True)
+
+    writer = SummaryWriter(f'log/{train_name}')
+
     if resume:
         VModel=sorted(os.listdir(save_model_dir))[-1]
         pretrained_ckpt = os.path.join(save_model_dir, VModel)
     else:
-        pretrained_ckpt = '../pretrained/modnet_photographic_portrait_matting.ckpt'
+        pretrained_ckpt = './pretrained/modnet_photographic_portrait_matting.ckpt'
     print(pretrained_ckpt)
     logging.info(f"model load {pretrained_ckpt}")
 
     modnet = MODNet()
     modnet = nn.DataParallel(modnet)
+
     GPU = True if torch.cuda.device_count() > 0 else False
     if GPU:
         print('Use GPU...')
@@ -862,53 +947,94 @@ def main(root, resume=False, std=0):
         print('Use CPU...')
         # Comment next row out if you change the image size or you don't use the modle author provided else pass
         modnet.load_state_dict(torch.load(pretrained_ckpt, map_location=torch.device('cpu')))
-    bs = 6  # batch size
-    lr = 0.0001  # learn rate
+
+    bs = 4  # batch size
+    lr = 0.01  # learn rate
     epochs = 100  # total epochs
     num_workers = 16
     optimizer = torch.optim.SGD(modnet.parameters(), lr=lr, momentum=0.9)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 13, 23, 33], gamma=0.1)
-    # dataloader = CREATE_YOUR_DATALOADER(bs)  # NOTE: please finish this function
-    dataset = ImagesDataset(root, torch_transforms)
-    dataloader = DataLoader(dataset, batch_size=bs, num_workers=num_workers, pin_memory=True)
+
+    dataset             = ImagesDataset(root, bg_path, torch_transforms)
+    valid_dataset       = ImagesDataset(root_valid, bg_path, torch_transforms)
+    dataloader          = DataLoader(dataset, batch_size=bs, num_workers=num_workers, pin_memory=True, shuffle=True)
+    valid_dataloader    = DataLoader(valid_dataset, batch_size=1, num_workers=num_workers, pin_memory=True, shuffle=True)
+
+
+    latest_step     = 0
+
+    # write step number
+    WRITE_LOSS      = 10
+    WRITE_TRAIN_IMG = 500
+    WRITE_VALID_IMG = 10000
 
     for epoch in range(std, epochs):
         if std == 0:
             epoch += 1
         mattes = []
         for idx, (img_file, image, trimap, gt_matte) in enumerate(dataloader, start=1):
+
+            latest_step = latest_step + 1
+
             try:
                 trimap = np.transpose(trimap, (0, 3, 1, 2)).float().cuda()
             except:
                 print('----------------------',img_file, optimizer.param_groups[0]['lr'])
                 continue
-            image = image.cuda()
-            gt_matte = gt_matte.cuda()
-            semantic_loss, detail_loss, matte_loss = supervised_training_iter(modnet, optimizer, image, trimap,
-                                                                              gt_matte)
+            
+            image = image.cuda(non_blocking=True)
+            gt_matte = gt_matte.cuda(non_blocking=True)
+
+            semantic_loss, detail_loss, matte_loss, pred_matte = supervised_training_iter(modnet, optimizer, image, trimap, gt_matte)
+            
             info = f"epoch: {epoch}/{epochs} semantic_loss: {semantic_loss}, detail_loss: {detail_loss}, matte_loss： {matte_loss}"
+            
             if semantic_loss > 1 or detail_loss > 1 or matte_loss > 1:
                 logging.info(img_file)
+            
             print(idx, info, optimizer.param_groups[0]['lr'])
             mattes.append(float(matte_loss))
+
+            if (latest_step + 1) % WRITE_LOSS == 0:
+                writer.add_scalar('matte_loss', matte_loss, latest_step)
+
+            if (latest_step + 1) % WRITE_TRAIN_IMG == 0:
+                writer.add_image('image', make_grid(image, nrow=5), latest_step)
+                writer.add_image('gt_matte', make_grid(gt_matte, nrow=5), latest_step)
+                writer.add_image('pred_matte', make_grid(pred_matte, nrow=5), latest_step)
+
+            if (latest_step + 1) % WRITE_VALID_IMG == 0:
+                #valid(modnet, valid_dataloader, writer, latest_step)
+                torch.save(modnet.state_dict(), os.path.join(save_model_dir, 'matting_{:0>4d}.ckpt'.format(latest_step)))
+                print(f'----------{epoch}--------------save model over-----------------------------------')
+                logging.info(f'------save model------{epoch}  {epoch}.ckpt')
+                
+        
         avg_matte = float(np.mean(mattes))
         logging.info(f"epoch: {epoch}/{epochs}, matte_loss: {avg_matte}")
+        
         lr_scheduler.step()
-        torch.save(modnet.state_dict(), os.path.join(save_model_dir, 'matting_{:0>4d}.ckpt'.format(epoch)))
-        print(f'----------{epoch}--------------save model over-----------------------------------')
-        logging.info(f'------save model------{epoch}  {epoch}.ckpt')
+        
+
 
 
 def mainSoc(root, std=0):
+    
     save_model_dir = 'SaveModel'
+    save_log_dir = 'log'
+    os.makedirs(save_model_dir, exist_ok=True)
+    os.makedirs(save_log_dir, exist_ok=True)
+
     VModel=sorted(os.listdir(save_model_dir))[-1]
     pretrained_ckpt = os.path.join(save_model_dir, VModel)
     print(pretrained_ckpt)
     logging.info(f"model load {pretrained_ckpt}")
+    print(pretrained_ckpt)
 
     modnet = MODNet()
     modnet = nn.DataParallel(modnet)
+
     GPU = True if torch.cuda.device_count() > 0 else False
     if GPU:
         print('Use GPU...')
@@ -917,11 +1043,13 @@ def mainSoc(root, std=0):
     else:
         print('Use CPU...')
         modnet.load_state_dict(torch.load(pretrained_ckpt, map_location=torch.device('cpu')))
-    bs = 8  # batch size
+    
+    bs = 4  # batch size
     lr = 0.00001  # learn rate 0.00001
     epochs = 60  # total epochs 10
     num_workers = 16
     optimizer = torch.optim.Adam(modnet.parameters(), lr=lr, betas=(0.9, 0.99))
+
     dataset = ImagesSocDataset(root, torch_transforms)
     dataloader = DataLoader(dataset, batch_size=bs, num_workers=num_workers, pin_memory=True)
 
@@ -930,7 +1058,7 @@ def mainSoc(root, std=0):
         detail_loss=[]
         backup_modnet = copy.deepcopy(modnet)
         for idx, image in enumerate(dataloader, start=1):
-            image = image.cuda()
+            image = image.cuda(non_blocking=True)
             soc_semantic_loss, soc_detail_loss = soc_adaptation_iter(modnet, backup_modnet, optimizer, image)
             info = f"epoch: {epoch}/{epochs} soc_semantic_loss: {soc_semantic_loss}, soc_detail_loss: {soc_detail_loss}"
             if soc_semantic_loss > 1 or soc_detail_loss>1:
@@ -945,8 +1073,58 @@ def mainSoc(root, std=0):
         print(f'------save soc model------{epoch}  {epoch}.ckpt')
 
 
+def valid(model, dataloader, writer, step):
+
+    model.eval()
+
+    add_loss = 0
+
+    with torch.no_grad():
+        for idx, (img_file, image, trimap, gt_matte) in enumerate(dataloader, start=1):
+
+            image = image.cuda(non_blocking=True)
+            gt_matte = gt_matte.cuda(non_blocking=True)
+
+            _, _, pred_matte = model(image, False)
+
+            #import matplotlib.pyplot as plt
+            #plt.imshow(pred_matte)
+            #plt.show()
+
+            #print(pred_matte.shape)
+            #pred_matte = pred_matte.permute(0, 2, 3, 1)
+
+            #print(pred_matte.shape)
+            #print(gt_matte.shape)
+
+            # calculate the matte loss
+            matte_loss = compute_loss(pred_matte, gt_matte)
+
+            # add matte_loss
+            add_loss += matte_loss
+            #print(idx, matte_loss, add_loss)
+
+    # calc total_loss
+    total_loss = add_loss / idx
+    #print(idx, matte_loss, add_loss, total_loss)
+
+    writer.add_scalar('valid_loss', total_loss, step)
+    writer.add_image('valid_image', make_grid(image, nrow=5), step)
+    writer.add_image('valid_pred_matte', make_grid(pred_matte, nrow=5), step)
+
+    model.train()
+
+    return
+
+
+def compute_loss(pred_matte, gt_matte):
+    return F.l1_loss(pred_matte, gt_matte)
+
+
 if __name__ == '__main__':
-    path = 'MattingDataset/train'
-    soc_path="MattingDataset/trainSoc"
-    main(path, std=10)
+    train_path  = "/data2/BackgroundMattingV2_Dataset/VideoMatte240K_JPEG_SD/train"
+    valid_path  = "/data2/PPM-100"
+    bg_path     = "/data2/BackgroundMattingV2_Dataset/Backgrounds"
+    soc_path    = "/data2/BackgroundMattingV2_Dataset/VideoMatte240K_JPEG_SD/train"
+    main(train_path, valid_path, bg_path, std=0, train_name="VideoMatte240K_JPEG_SD")
     #mainSoc(soc_path)

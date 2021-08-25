@@ -23,11 +23,29 @@ torch_transforms = transforms.Compose(
 def matting(video, result, alpha_matte=False, fps=30):
     # video capture
     vc = cv2.VideoCapture(video)
+    
+    # get video meta
+    vc_w = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vc_h = int(vc.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    vc_framerate = vc.get(cv2.CAP_PROP_FPS)
+    print(vc_w, vc_h, vc_framerate)
+
+    if vc_w >= vc_h:
+        ROTATE = True
+    else:
+        ROTATE = False
 
     if vc.isOpened():
         rval, frame = vc.read()
     else:
         rval = False
+
+    if(ROTATE):
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+#    import matplotlib.pyplot as plt
+#    plt.imshow(frame)
+#    plt.show()
 
     if not rval:
         print('Failed to read the video: {0}'.format(video))
@@ -57,14 +75,17 @@ def matting(video, result, alpha_matte=False, fps=30):
             frame_PIL = Image.fromarray(frame_np)
             frame_tensor = torch_transforms(frame_PIL)
             frame_tensor = frame_tensor[None, :, :, :]
+            print(frame_tensor.shape)
             if GPU:
                 frame_tensor = frame_tensor.cuda()
 
             with torch.no_grad():
-                _, _, matte_tensor = modnet(frame_tensor, True)
+                _, _, matte_tensor = modnet(frame_tensor, False)
 
             matte_tensor = matte_tensor.repeat(1, 3, 1, 1)
+            print(matte_tensor.shape)
             matte_np = matte_tensor[0].data.cpu().numpy().transpose(1, 2, 0)
+            print(matte_np.shape)
             if alpha_matte:
                 view_np = matte_np * np.full(frame_np.shape, 255.0)
             else:
@@ -74,6 +95,10 @@ def matting(video, result, alpha_matte=False, fps=30):
             video_writer.write(view_np)
 
             rval, frame = vc.read()
+            
+            if(ROTATE):
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            
             c += 1
 
     video_writer.release()
@@ -95,7 +120,12 @@ if __name__ == '__main__':
         exit()
 
     print('Load pre-trained MODNet...')
-    pretrained_ckpt = './pretrained/modnet_webcam_portrait_matting.ckpt'
+    #pretrained_ckpt = './pretrained/modnet_webcam_portrait_matting.ckpt'
+    #pretrained_ckpt = './pretrained/modnet_photographic_portrait_matting.ckpt'
+    pretrained_ckpt = './pretrained/matting_2999.ckpt'
+
+
+    
     modnet = MODNet(backbone_pretrained=False)
     modnet = nn.DataParallel(modnet)
 
